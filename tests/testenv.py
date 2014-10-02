@@ -167,6 +167,8 @@ class TestEnvironment:
         quotedargs = ["'%s'" % arg for arg in cmdargs]
         cmdstr = 'python %s %s 2>&1' % \
                  (self.tar_scm_bin(), " ".join(quotedargs))
+        tar_scm = os.path.join(self.tests_dir, '..', 'tar_scm.sh')
+        cmdstr = '%s %s 2>&1' % (tar_scm, " ".join(quotedargs))
         print
         print ">>>>>>>>>>>"
         print "Running", cmdstr

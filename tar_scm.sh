@@ -1,0 +1,707 @@
+#!/bin/bash
+
+# A simple script to checkout or update a svn or git repo as source service
+#
+# (C) 2010 by Adrian Schröter <adrian@suse.de>
+#  
+# This program is free software; you can redistribute it and/or  
+# modify it under the terms of the GNU General Public License  
+# as published by the Free Software Foundation; either version 2  
+# of the License, or (at your option) any later version.  
+# See http://www.gnu.org/licenses/gpl-2.0.html for full license text.  
+
+SERVICE='tar_scm'
+
+set_default_params () {
+  MYSCM=""
+  MYURL=""
+  MYVERSION="_auto_"
+  MYFORMAT=""
+  MYPREFIX=""
+  MYFILENAME=""
+  MYREVISION=""
+  MYPACKAGEMETA=""
+  USE_SUBMODULES=enable
+#  MYHISTORYDEPTH=""
+  CHANGES_GENERATE=disable
+  CHANGES_REVISION=""
+  CHANGES_AUTHOR=""
+  INCLUDES=""
+}
+
+get_config_options () {
+  # config options for this host ?
+  if [ -f /etc/obs/services/$SERVICE ]; then
+    . /etc/obs/services/$SERVICE
+  fi
+  # config options for this user ?
+  if [ -f "$HOME"/.obs/$SERVICE ]; then
+    . "$HOME"/.obs/$SERVICE
+  fi
+}
+
+parse_params () {
+  while test $# -gt 0; do
+    if test -n "`echo \"$2\" | sed 's,[0-9a-zA-Z{}|@%:/._-]*,,g'`"; then
+      echo "Argument $1 got an argument with not supported char."
+      exit 1
+    fi
+    case $1 in
+      *-scm)
+        MYSCM="$2"
+        shift
+      ;;
+      *-url)
+        MYURL="$2"
+        shift
+      ;;
+      *-subdir)
+        MYSUBDIR="$2"
+        shift
+      ;;
+      *-revision)
+        MYREVISION="$2"
+        shift
+      ;;
+      *-version)
+        MYVERSION="$2"
+        shift
+      ;;
+      *-include)
+        INCLUDES="$INCLUDES $2"
+        shift
+      ;;
+      *-versionformat)
+        MYFORMAT="$2"
+        shift
+      ;;
+      *-versionprefix)
+        MYPREFIX="$2"
+        shift
+      ;;
+      *-exclude)
+        EXCLUDES="$EXCLUDES --exclude=${2#/}"
+        shift
+      ;;
+      *-filename)
+        MYFILENAME="${2#/}"
+        shift
+      ;;
+      *-package-meta)
+        MYPACKAGEMETA="${2#/}"
+        shift
+      ;;
+      *-outdir)
+        MYOUTDIR="$2"
+        shift
+      ;;
+      *-history-depth)
+        echo "history-depth parameter is obsolete and will be ignored"
+        shift
+      ;;
+      *-submodules)
+        USE_SUBMODULES="$2"
+        shift
+      ;;
+      *-changesgenerate)
+        CHANGES_GENERATE="$2"
+        shift
+      ;;
+      *-changesauthor)
+        CHANGES_AUTHOR="$2"
+        shift
+      ;;
+      *)
+        echo "Unknown parameter: $1"
+        echo 'Usage: $SERVICE --scm $SCM --url $URL [--subdir $SUBDIR] [--revision $REVISION] [--version $VERSION] [--include $INCLUDE]* [--exclude $EXCLUDE]* [--versionformat $FORMAT] [--versionprefix $PREFIX] [--filename $FILENAME] [--package-meta $META] [--submodules disable] --outdir $OUT'
+        exit 1
+      ;;
+    esac
+    shift
+  done
+}
+
+error () {
+  echo "ERROR: $*"
+  exit 1
+}
+
+debug () {
+  [ -n "$DEBUG_TAR_SCM" ] && echo "$*"
+}
+
+safe_run () {
+  if ! "$@"; then
+    error "$* failed; aborting!"
+  fi
+}
+
+sanitise_params () {
+  TAR_VERSION="$MYVERSION"
+
+  if [ -z "$MYSCM" ]; then
+    error "no scm is given via --scm parameter (git/svn/hg/bzr)!"
+  fi
+  if [ -z "$MYURL" ]; then
+    error "no checkout URL is given via --url parameter!"
+  fi
+  if [ -z "$MYOUTDIR" ]; then
+    error "no output directory is given via --outdir parameter!"
+  fi
+
+  FILE="$MYFILENAME"
+  WD_VERSION="$MYVERSION"
+  if [ -z "$MYPACKAGEMETA" ]; then
+    EXCLUDES="$EXCLUDES --exclude-vcs"
+  fi
+  # if [ "$MYHISTORYDEPTH" == "full" ]; then
+  #   MYHISTORYDEPTH="999999999"
+  # fi
+}
+
+detect_default_filename_param () {
+  if [ -n "$FILE" ]; then
+    return
+  fi
+
+  case "$MYSCM" in
+    git)
+      FILE="${MYURL%/}"
+      FILE="${FILE##*/}"
+      FILE="${FILE%.git}"
+      FILE="${FILE#*@*:}"
+      ;;
+    svn|hg|bzr)
+      FILE="${MYURL%/}"
+      FILE="${FILE##*/}"
+      ;;
+    *)
+      error "unknown SCM '$MYSCM'"
+  esac
+}
+
+detect_changes () {
+  # Try to load from _servicedata. We have to change $PWD, ET.parse() seems to be relative...
+  CHANGES_REVISION=$(python <<-EOF
+import os, shutil
+try:
+    # If lxml is available, we can use a parser that doesnt destroy comments
+    import lxml.etree as ET
+    xml_parser = ET.XMLParser(remove_comments=False)
+except ImportError:
+    import xml.etree.ElementTree as ET
+    xml_parser = None
+create_servicedata, tar_scm_service = False, None
+tar_scm_xmlstring = "  <service name=\"tar_scm\">\n    <param name=\"url\">${MYURL}</param>\n  </service>\n"
+root=None
+try:
+    tree = ET.parse(os.path.join("$SRCDIR", "_servicedata"), parser=xml_parser)
+    root = tree.getroot()
+    for service in root.findall("service[@name='tar_scm']"):
+        for param in service.findall("param[@name='url']"):
+            if param.text == "${MYURL}":
+                tar_scm_service = service
+                break
+    if tar_scm_service is not None:
+        changerev_params = tar_scm_service.findall("param[@name='changesrevision']")
+        if len(changerev_params) == 1:
+            print(changerev_params[0].text)  # Found what we searched for!
+    else:
+        # File exists, is well-formed but does not contain the service we search
+        root.append(ET.fromstring(tar_scm_xmlstring))
+        create_servicedata = True
+except IOError as e:
+    root = ET.fromstring("<servicedata>\n%s</servicedata>\n" % tar_scm_xmlstring)
+    create_servicedata = True  # File doesnt exist
+except ET.ParseError as e:
+    if e.message.startswith("Document is empty"):
+        root = ET.fromstring("<servicedata>\n%s</servicedata>\n" % tar_scm_xmlstring)
+        create_servicedata = True  # File is empty
+    else:
+        print("error: %s" % e) # File is mal-formed, bail out.
+except Exception as e:
+    print("error: %s" % e)  # Catch-all, since we are in a here-document
+
+if create_servicedata:
+    ET.ElementTree(root).write(os.path.join("$MYOUTDIR", "_servicedata"))
+else:
+    shutil.copy(os.path.join("$SRCDIR", "_servicedata"), os.path.join("$MYOUTDIR", "_servicedata"))
+EOF
+)
+  if [[ $CHANGES_REVISION == error* ]] ; then
+    echo $CHANGES_REVISION  # All we can do here, really.
+    exit 1
+  fi
+
+  safe_run cd $REPOPATH
+
+  case "$MYSCM" in
+    git)
+      if [ -z "$CHANGES_REVISION" ]; then
+        # Ok, first run. Let's ask git for a range...
+        CHANGES_REVISION=`safe_run git log -n10 --pretty=format:%H | tail -n 1`
+      fi
+      CURRENT_REVISION=`safe_run git log -n1 --pretty=format:%H`
+      CURRENT_REVISION=${CURRENT_REVISION:0:10} # shorten SHA1 hash
+      # Use pattern-matching to check if either revision is a prefix of the other. It's pretty common at least
+      # for git users to abbreviate commit hashes but people disagree on the exact length, thus:
+      if [[ ${CURRENT_REVISION} == ${CHANGES_REVISION}* || ${CHANGES_REVISION} == ${CURRENT_REVISION}* ]]; then
+        debug "No new commits, skipping changes file generation"
+        return
+      fi
+      debug "Generate changes between $CHANGES_REVISION and $CURRENT_REVISION"
+      lines=`safe_run git log --pretty=tformat:%s --no-merges ${CHANGES_REVISION}..${CURRENT_REVISION} | tac`
+      ;;
+    svn|hg|bzr)
+      debug "Unable to generate changes for subversion, mercurial or bazaar, skipping changes file generation"
+      return
+    ;;
+    *)
+      error "Unknown SCM '$MYSCM'"
+  esac
+  OLD_IFS="$IFS"
+  IFS=$'\n' CHANGES_LINES=( $lines )
+  IFS="$OLD_IFS"
+  CHANGES_REVISION=$CURRENT_REVISION
+}
+
+write_changes () {
+  # Replace or add changesrevision in _servicedata file and do it in Python, otherwise sth. like
+  # https://gist.github.com/mralexgray/1209534 would be needed. The stdlib xml module's XPath
+  # support is quite basic, thus there are some for-loops in the code:
+  python <<-EOF
+import os
+try:
+    # If lxml is available, we can use a parser that doesn't destroy comments
+    import lxml.etree as ET
+    xml_parser = ET.XMLParser(remove_comments=False)
+except ImportError:
+    import xml.etree.ElementTree as ET
+    xml_parser = None
+tree = ET.parse(os.path.join("$MYOUTDIR", "_servicedata"), parser=xml_parser)
+root = tree.getroot()
+changed, tar_scm_service = False, None
+for service in root.findall("service[@name='tar_scm']"):
+    for param in service.findall("param[@name='url']"):
+        if param.text == "${MYURL}":
+            tar_scm_service = service
+            break
+if tar_scm_service is not None:
+    changerev_params = tar_scm_service.findall("param[@name='changesrevision']")
+    if len(changerev_params) == 1:  # already present, just update
+        if changerev_params[0].text != "${CHANGES_REVISION}":
+            changerev_params[0].text = "${CHANGES_REVISION}"
+            changed = True
+    else:  # not present, add changesrevision element
+        tar_scm_service.append(ET.fromstring("    <param name=\"changesrevision\">${CHANGES_REVISION}</param>\n"))
+        changed = True
+    if changed:
+        tree.write(os.path.join("$MYOUTDIR", "_servicedata"))
+else:
+    print("File _servicedata is missing tar_scm with URL '${MYURL}'")
+EOF
+
+  if [ ${#CHANGES_LINES[@]} -eq 0 ] ; then
+    echo "No changes since $CHANGES_REVISION, skipping changes file generation"
+    return
+  fi
+
+  if [ -z "$CHANGES_AUTHOR" ] ; then
+    OSCRC="$HOME/.oscrc"
+    if [ -f $OSCRC ] ; then
+      CHANGES_AUTHOR=$(grep -e '^email.*=' $OSCRC | head -n1 | cut -d"=" -f2)
+    else
+      CHANGES_AUTHOR="opensuse-packaging@opensuse.org"
+    fi
+  fi
+
+  change_entry="-------------------------------------------------------------------
+$(LC_ALL=POSIX TZ=UTC date) - ${CHANGES_AUTHOR}
+
+- Update to version ${TAR_VERSION}:"
+  for commit in "${CHANGES_LINES[@]}" ; do
+      change_entry="$change_entry
+  + $commit"
+  done
+  change_entry="$change_entry
+"
+
+  # Prepend change entry to changes files
+  for changes_file in $SRCDIR/*.changes ; do
+      tmpfile=$(mktemp)
+      echo "$change_entry" | cat - $changes_file > $tmpfile && mv $tmpfile $MYOUTDIR/$(basename $changes_file)
+  done
+}
+
+fetch_upstream () {
+  TOHASH="$MYURL"
+  [ "$MYSCM" = 'svn' ] && TOHASH="$TOHASH/$MYSUBDIR"
+  HASH=`echo "$TOHASH" | sha256sum | cut -d\  -f 1`
+  REPOCACHE=
+  if [ -n "$CACHEDIRECTORY" ]; then
+    REPOCACHEINCOMING="$CACHEDIRECTORY/incoming"
+    REPOCACHEROOT="$CACHEDIRECTORY/repo"
+    REPOCACHE="$REPOCACHEROOT/$HASH"
+    REPOURLCACHE="$CACHEDIRECTORY/repourl/$HASH"
+  fi
+
+  if [ -z "$MYREVISION" ]; then
+    case "$MYSCM" in
+      git)
+        MYREVISION=master
+        ;;
+      hg)
+        MYREVISION=tip
+        ;;
+      # bzr)
+      #   MYREVISION=HEAD
+      #   ;;
+    esac
+    if [ -n "$MYREVISION" ]; then
+      debug "no revision specified; defaulting to $MYREVISION"
+    fi
+  fi
+
+  debug "check local cache if configured"
+  if [ -n "$CACHEDIRECTORY" -a -d "$REPOCACHE/.$MYSCM" ]; then
+    debug "cache hit: $REPOCACHE/.$MYSCM"
+    check_cache
+    echo "Found $TOHASH in $REPOCACHE; updating ..."
+    update_cache
+    REPOPATH="$REPOCACHE"
+  else
+    if [ -n "$CACHEDIRECTORY" ]; then
+      debug "cache miss: $REPOCACHE/.$MYSCM"
+    else
+      debug "cache not enabled"
+    fi
+
+    calc_dir_to_clone_to
+    debug "new $MYSCM checkout to $CLONE_TO"
+    initial_clone
+
+    if [ -n "$CACHEDIRECTORY" ]; then
+      cache_repo
+      REPOPATH="$REPOCACHE"
+    else
+      REPOPATH="$MYOUTDIR/$FILE"
+    fi
+  fi
+
+  safe_run cd "$REPOPATH"
+  switch_to_revision
+  if [ "$TAR_VERSION" == "_auto_" -o -n "$MYFORMAT" ]; then
+    detect_version
+  fi
+  if [ "$CHANGES_GENERATE" == "enable" ]; then
+    detect_changes
+  fi
+}
+
+calc_dir_to_clone_to () {
+  if [ -n "$CACHEDIRECTORY" ]; then
+    safe_run cd "$REPOCACHEINCOMING"
+    # Use dry-run mode because git/hg refuse to clone into
+    # an empty directory on SLES11
+    debug mktemp -u -d "tmp.XXXXXXXXXX"
+    CLONE_TO=`mktemp -u -d "tmp.XXXXXXXXXX"`
+  else
+    CLONE_TO="$FILE"
+  fi
+}
+
+initial_clone () {
+  echo "Fetching from $MYURL ..."
+
+  case "$MYSCM" in
+    git)
+      # Clone with full depth; so that the revision can be found if specified
+      safe_run git clone "$MYURL" "$CLONE_TO"
+      if [ "$USE_SUBMODULES" == "enable" ]; then
+        safe_run cd "$CLONE_TO"
+        safe_run git submodule update --init --recursive
+        safe_run cd ..
+      fi
+      ;;
+    svn)
+      args=
+      [ -n "$MYREVISION" ] && args="-r$MYREVISION"
+      if [[ $(svn --version --quiet) > "1.5.99" ]]; then
+        TRUST_SERVER_CERT="--trust-server-cert"
+      fi
+      safe_run svn checkout --non-interactive $TRUST_SERVER_CERT \
+        $args "$MYURL/$MYSUBDIR" "$CLONE_TO"
+      MYSUBDIR= # repo root is subdir
+      ;;
+    hg)
+      safe_run hg clone "$MYURL" "$CLONE_TO"
+      ;;
+    bzr)
+      args=
+      [ -n "$MYREVISION" ] && args="-r $MYREVISION"
+      safe_run bzr checkout $args "$MYURL" "$CLONE_TO"
+      ;;
+    *)
+      error "unknown SCM '$MYSCM'"
+  esac
+}
+
+cache_repo () {
+  if [ -e "$REPOCACHE" ]; then
+    error "Somebody else beat us to populating the cache for $MYURL ($REPOCACHE)"
+  else
+    # FIXME: small race window here; do source services need to be thread-safe?
+    debug "mv #1: $CLONE_TO -> $REPOCACHE"
+    safe_run mv "$CLONE_TO" "$REPOCACHE"
+    echo "$MYURL" > "$REPOURLCACHE"
+    echo "Cached $MYURL at $REPOCACHE"
+  fi
+}
+
+check_cache () {
+  CACHEDURL=`cat "$REPOURLCACHE"`
+  [ -z "$CACHEDURL" ] && CACHEDURL='<unknown URL>'
+  if [ "$MYURL" != "$CACHEDURL" ]; then
+    error "Corrupt cache: cache for repo $MYURL was recorded as being from $CACHEDURL"
+  fi
+}
+
+update_cache () {
+  safe_run cd "$REPOCACHE"
+
+  case "$MYSCM" in
+    git)
+      safe_run git fetch
+      ;;
+    svn)
+      args=
+      [ -n "$MYREVISION" ] && args="-r$MYREVISION"
+      safe_run svn update $args
+      MYSUBDIR= # repo root is subdir
+      ;;
+    hg)
+      if ! out=`hg pull`; then
+        if [[ "$out" == *'no changes found'* ]]; then
+          # Contrary to the docs, hg pull returns exit code 1 when
+          # there are no changes to pull, but we don't want to treat
+          # this as an error.
+          :
+        else
+          error "hg pull failed; aborting!"
+        fi
+      fi
+      ;;
+    bzr)
+      args=
+      [ -n "$MYREVISION" ] && args="-r$MYREVISION"
+      safe_run bzr update $args
+      ;;
+    *)
+      error "unknown SCM '$MYSCM'"
+  esac
+}
+
+switch_to_revision () {
+  case "$MYSCM" in
+    git)
+      # $MYREVISION may refer to any of the following:
+      #
+      # - explicit SHA1: a1b2c3d4....
+      #   - the SHA1 must be reachable from a default clone/fetch (generally, must be
+      #     reachable from some branch or tag on the remote).
+      # - short branch name: "master", "devel" etc.
+      # - explicit ref: refs/heads/master, refs/tags/v1.2.3, refs/changes/49/11249/1
+      #
+      if ! git rev-parse --verify --quiet tar_scm_tmp >/dev/null; then
+        safe_run git checkout -b tar_scm_tmp
+      fi
+      if git rev-parse --verify --quiet "origin/$MYREVISION" >/dev/null; then
+          safe_run git reset --hard "origin/$MYREVISION"
+      else
+          safe_run git reset --hard "$MYREVISION"
+      fi
+      if [ "$USE_SUBMODULES" == "enable" ]; then
+          safe_run git submodule update --recursive
+      fi
+      ;;
+    svn|bzr)
+      : # should have already happened via checkout or update
+      ;;
+    hg)
+      safe_run hg update "$MYREVISION"
+      ;;
+    # bzr)
+    #   safe_run bzr update
+    #   if [ -n "$MYREVISION" ]; then
+    #     safe_run bzr revert -r "$MYREVISION"
+    #   fi
+    #   ;;
+    *)
+      error "unknown SCM '$MYSCM'"
+  esac
+}
+
+detect_version () {
+  if [ -z "$MYFORMAT" ]; then
+    case "$MYSCM" in
+      git)
+        MYFORMAT="%ct"
+        ;;
+      hg)
+        MYFORMAT="{rev}"
+        ;;
+      svn|bzr)
+        MYFORMAT="%r"
+        ;;
+      *)
+        error "unknown SCM '$MYSCM'"
+        ;;
+    esac
+  fi
+
+  safe_run cd "$REPOPATH"
+  [ -n "$MYPREFIX" ] && MYPREFIX="$MYPREFIX."
+  get_version
+  TAR_VERSION="$MYPREFIX$version"
+}
+
+ISO_CLEANUP_RE='s@([0-9]{4})-([0-9]{2})-([0-9]{2}) +([0-9]{2})([:]([0-9]{2})([:]([0-9]{2}))?)?( +[-+][0-9]{3,4})?@\1\2\3T\4\6\8@g'
+
+get_version () {
+  case "$MYSCM" in
+    git)
+      #version=`safe_run git show --pretty=format:"$MYFORMAT" | head -n 1`
+      if [[ "$MYFORMAT" =~ .*@PARENT_TAG@.*  ]] ; then
+          PARENT_TAG=$(git describe --tags --abbrev=0)
+          PARENT_TAG=${PARENT_TAG/-/.}
+          MYFORMAT=${MYFORMAT/@PARENT_TAG@/$PARENT_TAG}
+          echo "MYFORMAT: $MYFORMAT"
+          if [ $? -gt 0 ] ; then
+              echo -e "\e[0;31mThe git repository has no tags, thus @PARENT_TAG@ can not be expanded\e[0m"
+              exit 1
+          fi
+      fi
+      version=`safe_run git log -n1 --date=short --pretty=format:"$MYFORMAT" | sed -r -e "$ISO_CLEANUP_RE" -e 's@[-:]@@g'`
+      ;;
+    svn)
+      #rev=`LC_ALL=C safe_run svn info | awk '/^Revision:/ { print $2 }'`
+      rev=`LC_ALL=C safe_run svn info | sed -n 's,^Last Changed Rev: \(.*\),\1,p'`
+      version="${MYFORMAT//%r/$rev}"
+      ;;
+    hg)
+      rev=`safe_run hg id -n`
+      # Mercurial internally stores commit dates in its changelog
+      # context objects as (epoch_secs, tz_delta_to_utc) tuples (see
+      # mercurial/util.py).  For example, if the commit was created
+      # whilst the timezone was BST (+0100) then tz_delta_to_utc is
+      # -3600.  In this case,
+      #
+      #     hg log -l1 -r$rev --template '{date}\n'
+      #
+      # will result in something like '1375437706.0-3600' where the
+      # first number is timezone-agnostic.  However, hyphens are not
+      # permitted in rpm version numbers, so tar_scm removes them via
+      # sed.  This is required for this template format for any time
+      # zone "numerically east" of UTC.
+      #
+      # N.B. since the extraction of the timestamp as a version number
+      # is generally done in order to provide chronological sorting,
+      # ideally we would ditch the second number.  However the
+      # template format string is left up to the author of the
+      # _service file, so we can't do it here because we don't know
+      # what it will expand to.  Mercurial provides template filters
+      # for dates (e.g. 'hgdate') which _service authors could
+      # potentially use, but unfortunately none of them can easily
+      # extract only the first value from the tuple, except for maybe
+      # 'sub(...)' which is only available since 2.4 (first introduced
+      # in openSUSE 12.3).
+      version=`safe_run hg log -l1 -r$rev --template "$MYFORMAT" | sed -r -e "$ISO_CLEANUP_RE" -e 's@[-:]@@g'`
+      ;;
+    bzr)
+      #safe_run bzr log -l1 ...
+      rev=`safe_run bzr revno`
+      version="${MYFORMAT//%r/$rev}"
+      ;;
+    *)
+      error "unknown SCM '$MYSCM'"
+  esac
+}
+
+prep_tree_for_tar () {
+  if [ ! -e "$REPOPATH/$MYSUBDIR" ]; then
+    error "directory does not exist: $REPOPATH/$MYSUBDIR"
+  fi
+
+  if [ -z "$TAR_VERSION" ]; then
+    TAR_BASENAME="$FILE"
+  else
+    TAR_BASENAME="${FILE}-${TAR_VERSION}"
+  fi
+
+  MYINCLUDES=""
+
+  for INC in $INCLUDES; do
+    MYINCLUDES="$MYINCLUDES $TAR_BASENAME/$INC"
+  done
+  if [ -z "$MYINCLUDES" ]; then
+    MYINCLUDES="$TAR_BASENAME"
+  fi
+
+  safe_run cd "$MYOUTDIR"
+
+  if [ -n "$CACHEDIRECTORY" ]; then
+    debug cp -a "$REPOPATH/$MYSUBDIR" "$TAR_BASENAME"
+    safe_run cp -a "$REPOPATH/$MYSUBDIR" "$TAR_BASENAME"
+  else
+    debug mv3 "$REPOPATH/$MYSUBDIR" "$TAR_BASENAME"
+    safe_run mv "$REPOPATH/$MYSUBDIR" "$TAR_BASENAME"
+  fi
+}
+
+create_tar () {
+  TARFILE="${TAR_BASENAME}.tar"
+  TARPATH="$MYOUTDIR/$TARFILE"
+  debug tar --owner=root --group=root -cf "$TARPATH" $EXCLUDES $MYINCLUDES
+  safe_run tar --owner=root --group=root -cf "$TARPATH" $EXCLUDES $MYINCLUDES
+  echo "Created $TARFILE"
+}
+
+cleanup () {
+  debug rm -rf "$TAR_BASENAME" "$FILE"
+  rm -rf "$TAR_BASENAME" "$FILE"
+}
+
+main () {
+  # Ensure we get predictable results when parsing the output of commands
+  # like 'git branch'
+  LANG=C
+
+  set_default_params
+  if [ -z "$DEBUG_TAR_SCM" ]; then
+    get_config_options
+  else
+    # We're in test-mode, so don't let any local site-wide
+    # or per-user config impact the test suite.
+    :
+  fi
+  parse_params "$@"
+  sanitise_params
+
+  SRCDIR=$(pwd)
+  cd "$MYOUTDIR"
+  detect_default_filename_param
+
+  fetch_upstream
+
+  prep_tree_for_tar
+  create_tar
+  if [ "$CHANGES_GENERATE" == "enable" ]; then
+    write_changes
+  fi
+
+  cleanup
+}
+
+main "$@"
+
+exit 0

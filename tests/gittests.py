@@ -129,14 +129,14 @@ class GitTests(GitHgTests):
           <servicedata>
             <service name="tar_scm">
               <param name="url">%s</param>
-              <param name="changesrevision">([0-9a-f]{40})</param>
+              <param name="changesrevision">([0-9a-f]{10,40})</param>
             </service>
           </servicedata>""" % self.fixtures.repo_url
         (expected, count) = re.subn('\s{2,}', '\s*', expected)
         m = re.match(expected, sd)
         self.assertTrue(m, "\n'%s'\n!~ /%s/" % (sd, expected))
         sha1 = m.group(1)
-        self.assertEqual(sha1, expected_sha1)
+        self.assertTrue(expected_sha1.startswith(sha1))
 
     def test_changesgenerate_disabled(self):
         self.tar_scm_std('--changesgenerate', 'disable')
